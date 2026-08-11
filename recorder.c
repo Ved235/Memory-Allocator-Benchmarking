@@ -7,7 +7,10 @@
 #include <unistd.h>
 
 static void* (*real_malloc)(size_t) = NULL;
+static void (*real_free)(void* p) = NULL;
+
 static _Atomic unsigned long mallocCount = 0;
+static _Atomic unsigned long freeCount = 0;
 static __thread int insideHook = 0;
 
 void* malloc(size_t s) {
@@ -30,4 +33,24 @@ void* malloc(size_t s) {
     insideHook = 0;
 
     return p;
+}
+
+void free(void* p) {
+    if (insideHook || !p) {
+        return real_free(p);
+    }
+
+    if (!real_free) {
+        real_free = dlsym(RTLD_NEXT, "free");
+    }
+
+    insideHook = 1;
+
+    real_free(p);
+    unsigned long n = atomic_fetch_add(&freeCount, 1) + 1;
+    printf("free: %lu %p\n", n, p);
+
+    insideHook = 0;
+
+    return;
 }
