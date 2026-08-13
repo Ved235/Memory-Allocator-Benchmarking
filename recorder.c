@@ -5,6 +5,11 @@
 #include <stdatomic.h>
 #include <dlfcn.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <fcntl.h>
+#include <stdint.h>
 
 static void* (*real_malloc)(size_t) = NULL;
 static void (*real_free)(void* p) = NULL;
@@ -17,6 +22,66 @@ static _Atomic unsigned long callocCount = 0;
 static _Atomic unsigned long reallocCount = 0;
 
 static __thread int insideHook = 0;
+static pthread_once_t fileOpen = PTHREAD_ONCE_INIT;
+static int fileFD = -1;
+
+static void init_file(void) {
+    fileFD = open("alloc_log.txt",
+                  O_WRONLY | O_CREAT | O_APPEND,
+                  0644
+                 );
+}
+
+static void open_file(void) {
+    pthread_once(&fileOpen, init_file);
+}
+
+__attribute__((constructor))
+static void preload_init(void) {
+    open_file();
+}
+
+static uint64_t timestamp(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL +
+           (uint64_t)ts.tv_nsec;
+}
+
+static void log_alloc(size_t size, void *ptr)
+{
+    char buf[128];
+    long tid = syscall(SYS_gettid);
+    int len = snprintf(
+                  buf,
+                  sizeof(buf),
+                  "a %lu %ld %zu %p\n",
+                  timestamp(),
+                  tid,
+                  size,
+                  ptr
+              );
+
+    if (len > 0)
+        write(fileFD, buf, (size_t)len);
+}
+
+static void log_free(void *ptr)
+{
+    char buf[128];
+    long tid = syscall(SYS_gettid);
+    int len = snprintf(
+                  buf,
+                  sizeof(buf),
+                  "f %lu %ld %p\n",
+                  timestamp(),
+                  tid,
+                  ptr
+              );
+
+    if (len > 0)
+        write(fileFD, buf, (size_t)len);
+}
 
 void* malloc(size_t s) {
     if (insideHook) {
@@ -31,9 +96,10 @@ void* malloc(size_t s) {
 
     insideHook = 1;
 
+    open_file();
     void* p = real_malloc(s);
-    unsigned long n = atomic_fetch_add(&mallocCount, 1) + 1;
-    printf("malloc: %lu %zu %p\n", n, s, p);
+    mallocCount++;
+    log_alloc(s, p);
 
     insideHook = 0;
 
@@ -51,9 +117,10 @@ void free(void* p) {
 
     insideHook = 1;
 
+    open_file();
     real_free(p);
-    unsigned long n = atomic_fetch_add(&freeCount, 1) + 1;
-    printf("free: %lu %p\n", n, p);
+    freeCount++;
+    log_free(p);
 
     insideHook = 0;
 
@@ -74,8 +141,8 @@ void* calloc(size_t numElements, size_t s) {
     insideHook = 1;
 
     void* p = real_calloc(numElements, s);
-    unsigned long n = atomic_fetch_add(&callocCount, 1) + 1;
-    printf("calloc: %lu %zu %p\n", n, s * numElements, p);
+    callocCount++;
+    //printf("calloc: %lu %zu %p\n", callocCount, s * numElements, p);
 
     insideHook = 0;
 
@@ -96,8 +163,8 @@ void* realloc(void* ptr, size_t s) {
     insideHook = 1;
 
     void* p = real_realloc(ptr, s);
-    unsigned long n = atomic_fetch_add(&reallocCount, 1) + 1;
-    printf("realloc: %lu %zu %p %p\n", n, s, p, ptr);
+    reallocCount++;
+    //printf("realloc: %lu %zu %p %p\n", reallocCount , s, p, ptr);
 
     insideHook = 0;
 
