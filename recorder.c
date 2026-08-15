@@ -16,11 +16,6 @@ static void (*real_free)(void *p) = NULL;
 static void *(*real_calloc)(size_t, size_t) = NULL;
 static void *(*real_realloc)(void *, size_t) = NULL;
 
-static _Atomic unsigned long mallocCount = 0;
-static _Atomic unsigned long freeCount = 0;
-static _Atomic unsigned long callocCount = 0;
-static _Atomic unsigned long reallocCount = 0;
-
 static __thread int insideHook = 0;
 
 static pthread_once_t fileOpen = PTHREAD_ONCE_INIT;
@@ -56,13 +51,13 @@ static void log_alloc(size_t size, void *ptr)
     char buf[128];
     long tid = syscall(SYS_gettid);
     int len = snprintf(
-        buf,
-        sizeof(buf),
-        "a %zu %p %ld %lu\n",
-        size,
-        ptr,
-        tid,
-        timestamp());
+                  buf,
+                  sizeof(buf),
+                  "a %zu %p %ld %lu\n",
+                  size,
+                  ptr,
+                  tid,
+                  timestamp());
     if (len > 0)
         write(fileFD, buf, (size_t)len);
 }
@@ -72,12 +67,12 @@ static void log_free(void *ptr)
     char buf[128];
     long tid = syscall(SYS_gettid);
     int len = snprintf(
-        buf,
-        sizeof(buf),
-        "f %p %ld %lu\n",
-        ptr,
-        tid,
-        timestamp());
+                  buf,
+                  sizeof(buf),
+                  "f %p %ld %lu\n",
+                  ptr,
+                  tid,
+                  timestamp());
     if (len > 0)
         write(fileFD, buf, (size_t)len);
 }
@@ -87,14 +82,14 @@ static void log_realloc(size_t size, void *new_ptr, void *old_ptr)
     char buf[128];
     long tid = syscall(SYS_gettid);
     int len = snprintf(
-        buf,
-        sizeof(buf),
-        "r %zu %p %p %ld %lu\n",
-        size,
-        new_ptr,
-        old_ptr,
-        tid,
-        timestamp());
+                  buf,
+                  sizeof(buf),
+                  "r %zu %p %p %ld %lu\n",
+                  size,
+                  new_ptr,
+                  old_ptr,
+                  tid,
+                  timestamp());
     if (len > 0)
         write(fileFD, buf, (size_t)len);
 }
@@ -104,14 +99,14 @@ static void log_calloc(size_t size, size_t numElements, void *ptr)
     char buf[128];
     long tid = syscall(SYS_gettid);
     int len = snprintf(
-        buf,
-        sizeof(buf),
-        "c %zu %zu %p %ld %lu\n",
-        size,
-        numElements,
-        ptr,
-        tid,
-        timestamp());
+                  buf,
+                  sizeof(buf),
+                  "c %zu %zu %p %ld %lu\n",
+                  size,
+                  numElements,
+                  ptr,
+                  tid,
+                  timestamp());
     if (len > 0)
         write(fileFD, buf, (size_t)len);
 }
@@ -131,7 +126,6 @@ void *malloc(size_t s)
     insideHook = 1;
     open_file();
     void *p = real_malloc(s);
-    mallocCount++;
     log_alloc(s, p);
     insideHook = 0;
     return p;
@@ -150,7 +144,6 @@ void free(void *p)
     insideHook = 1;
     open_file();
     real_free(p);
-    freeCount++;
     log_free(p);
     insideHook = 0;
     return;
@@ -171,7 +164,6 @@ void *calloc(size_t numElements, size_t s)
     insideHook = 1;
     open_file();
     void *p = real_calloc(numElements, s);
-    callocCount++;
     log_calloc(s, numElements, p);
     insideHook = 0;
     return p;
@@ -192,7 +184,6 @@ void *realloc(void *ptr, size_t s)
     insideHook = 1;
     open_file();
     void *p = real_realloc(ptr, s);
-    reallocCount++;
     log_realloc(s, p, ptr);
     insideHook = 0;
     return p;
