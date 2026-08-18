@@ -5,15 +5,22 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <unordered_set>
+#include <unordered_map>
+#include <algorithm>
 
 using Nanoseconds = std::chrono::nanoseconds;
 
-enum class MemoryOp {
+enum MemoryOp {
 	Alloc,
 	Free,
 	Calloc,
 	Realloc
 };
+
+std::unordered_set<uint64_t> tids;
+
+int counts[4] = {};
 
 struct MemoryEntry {
 	MemoryOp op = MemoryOp::Alloc;
@@ -102,6 +109,7 @@ std::vector<MemoryEntry> ParseJournal(const char* filepath) {
 
 		switch (op) {
 		case 'a':
+			++counts[MemoryOp::Alloc];
 			entry.op = MemoryOp::Alloc;
 			entry.allocSize = parse_uint64(p);
 			entry.ptr = parse_hex(p);
@@ -109,12 +117,14 @@ std::vector<MemoryEntry> ParseJournal(const char* filepath) {
 			entry.originalTimestamp = Nanoseconds{ static_cast<long long>(parse_uint64(p)) };
 			break;
 		case 'f':
+			++counts[MemoryOp::Free];
 			entry.op = MemoryOp::Free;
 			entry.ptr = parse_hex(p);
 			entry.threadId = parse_uint64(p);
 			entry.originalTimestamp = Nanoseconds{ static_cast<long long>(parse_uint64(p)) };
 			break;
 		case 'r':
+			++counts[MemoryOp::Realloc];
 			entry.op = MemoryOp::Realloc;
 			entry.allocSize = parse_uint64(p);
 			entry.ptr = parse_hex(p);
@@ -123,6 +133,7 @@ std::vector<MemoryEntry> ParseJournal(const char* filepath) {
 			entry.originalTimestamp = Nanoseconds{ static_cast<long long>(parse_uint64(p)) };
 			break;
 		case 'c':
+			++counts[MemoryOp::Calloc];
 			entry.op = MemoryOp::Calloc;
 			entry.allocSize = parse_uint64(p);
 			entry.numElements = parse_uint64(p);
@@ -131,9 +142,10 @@ std::vector<MemoryEntry> ParseJournal(const char* filepath) {
 			entry.originalTimestamp = Nanoseconds{ static_cast<long long>(parse_uint64(p)) };
 			break;
 		default:
-			std::cout << "Error\n";
+			std::cout << "Error at index: " << result.size() << "\n";
 			exit(1);
 		}
+		tids.insert(entry.threadId);
 		result.push_back(entry);
 	}
 
@@ -143,9 +155,136 @@ std::vector<MemoryEntry> ParseJournal(const char* filepath) {
 	return result;
 }
 
+void ProcessJournal(std::vector<MemoryEntry>& entries) {
+	std::unordered_map<uint64_t, size_t> ptrMap;
+	size_t idx = 0;
+	size_t numFixes = 0;
+
+	while (idx < entries.size()) {
+		auto& entry = entries[idx];
+		switch (entry.op) {
+		case MemoryOp::Alloc:
+		case MemoryOp::Calloc: {
+			if (ptrMap.find(entry.ptr) != ptrMap.end()) {
+				std::cerr << "Duplicate allocation for pointer: " << std::hex << entry.ptr
+				          << " at index: " << std::dec << idx << "\n";
+
+				auto itr = std::find_if(entries.begin() + idx + 1, entries.end(),
+				[&entry](const MemoryEntry & e) {
+					return (e.op == MemoryOp::Free && e.ptr == entry.ptr) ||
+					       (e.op == MemoryOp::Realloc && e.oldPtr == entry.ptr  && e.ptr != entry.ptr);
+				});
+
+				if (itr != entries.end()) {
+					size_t swapIdx = itr - entries.begin();
+					std::swap(entries[idx], entries[swapIdx]);
+					std::cerr << "Swapped with operation at index: " << swapIdx << "\n";
+					++numFixes;
+					continue;
+				} else {
+					std::abort();
+				}
+			}
+			ptrMap[entry.ptr] = idx;
+			break;
+		}
+		case MemoryOp::Free: {
+			if (ptrMap.find(entry.ptr) == ptrMap.end()) {
+				std::cerr << "Freeing unallocated pointer: " << std::hex << entry.ptr
+				          << " at index: " << std::dec << idx << "\n";
+
+				auto itr = std::find_if(entries.begin() + idx + 1, entries.end(),
+				[&entry](const MemoryEntry & e) {
+					return (e.op == MemoryOp::Alloc && e.ptr == entry.ptr) ||
+					       (e.op == MemoryOp::Calloc && e.ptr == entry.ptr) ||
+					       (e.op == MemoryOp::Realloc && e.ptr == entry.ptr);
+				});
+
+				if (itr != entries.end()) {
+					size_t swapIdx = itr - entries.begin();
+					std::swap(entries[idx], entries[swapIdx]);
+					std::cerr << "Swapped with operation at index: " << swapIdx << "\n";
+					++numFixes;
+					continue;
+				} else {
+					std::abort();
+				}
+			}
+
+			entry.allocIdx = ptrMap[entry.ptr];
+			ptrMap.erase(entry.ptr);
+			break;
+		}
+		case MemoryOp::Realloc: {
+			if (entry.oldPtr != 0) {
+				if (ptrMap.find(entry.oldPtr) == ptrMap.end()) {
+					std::cerr << "Reallocating unallocated pointer: " << std::hex << entry.oldPtr
+					          << " at index: " << std::dec << idx << "\n";
+
+					auto itr = std::find_if(entries.begin() + idx + 1, entries.end(),
+					[&entry](const MemoryEntry & e) {
+						return (e.op == MemoryOp::Alloc && e.ptr == entry.oldPtr) ||
+						       (e.op == MemoryOp::Calloc && e.ptr == entry.oldPtr) ||
+						       (e.op == MemoryOp::Realloc && e.ptr == entry.oldPtr);
+					});
+
+					if (itr != entries.end()) {
+						size_t swapIdx = itr - entries.begin();
+						std::swap(entries[idx], entries[swapIdx]);
+						std::cerr << "Swapped with operation at index: " << swapIdx << "\n";
+						++numFixes;
+						continue;
+					} else {
+						std::abort();
+					}
+				}
+
+				entry.allocIdx = ptrMap[entry.oldPtr];
+				ptrMap.erase(entry.oldPtr);
+			}
+
+			if (ptrMap.find(entry.ptr) != ptrMap.end()) {
+				std::cerr << "Realloc returned already allocated pointer: " << std::hex << entry.ptr
+				          << " at index: " << std::dec << idx << "\n";
+
+				auto itr = std::find_if(entries.begin() + idx + 1, entries.end(),
+				[&entry](const MemoryEntry & e) {
+					return (e.op == MemoryOp::Free && e.ptr == entry.ptr) ||
+					       (e.op == MemoryOp::Realloc && e.oldPtr == entry.ptr && e.ptr != entry.ptr);
+				});
+
+				if (itr != entries.end()) {
+					size_t swapIdx = itr - entries.begin();
+					std::swap(entries[idx], entries[swapIdx]);
+					std::cerr << "Swapped with operation at index: " << swapIdx << "\n";
+					++numFixes;
+					continue;
+				} else {
+					std::abort();
+				}
+			}
+
+			ptrMap[entry.ptr] = idx;
+			break;
+		}
+		default:
+			std::cerr << "Unknown operation at index " << idx << "\n";
+			std::abort();
+		}
+		++idx;
+	}
+
+	std::cout << "Total fixes: " << numFixes << "\n";
+	std::cout << "Remaining live allocations: " << ptrMap.size() << "\n";
+}
+
 int main() {
 	std::cout << "Parsing journal\n";
 	auto entries = ParseJournal("/home/ved/Desktop/stkcart/stk-code/cmake_build/alloc_log.txt");
 	std::cout << "Parsed " << entries.size() << " entries\n";
+	std::cout << "Unique thread ids: " << tids.size() << "\n";
+	std::cout << "Counts are: " << counts[0] << " " << counts[1] << " " << counts[2] << " " << counts[3] << "\n";
+	std::cout << "Pre processing journal\n";
+	ProcessJournal(entries);
 	return 0;
 }

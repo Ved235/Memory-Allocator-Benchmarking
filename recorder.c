@@ -15,6 +15,9 @@ static void *(*real_malloc)(size_t) = NULL;
 static void (*real_free)(void *p) = NULL;
 static void *(*real_calloc)(size_t, size_t) = NULL;
 static void *(*real_realloc)(void *, size_t) = NULL;
+static void *(*real_memalign)(size_t, size_t) = NULL;
+static int (*real_posix_memalign)(void **, size_t, size_t) = NULL;
+static void *(*real_aligned_alloc)(size_t, size_t) = NULL;
 
 static __thread int insideHook = 0;
 
@@ -185,6 +188,69 @@ void *realloc(void *ptr, size_t s)
     open_file();
     void *p = real_realloc(ptr, s);
     log_realloc(s, p, ptr);
+    insideHook = 0;
+    return p;
+}
+
+void *memalign(size_t alignment, size_t size)
+{
+    if (insideHook)
+    {
+        const char msg[] = "RECURSIVE memalign\n";
+        write(STDERR_FILENO, msg, sizeof(msg) - 1);
+        return real_memalign(alignment, size);
+    }
+    if (!real_memalign)
+    {
+        real_memalign = dlsym(RTLD_NEXT, "memalign");
+    }
+    insideHook = 1;
+    open_file();
+    void *p = real_memalign(alignment, size);
+    log_alloc(size, p);
+    insideHook = 0;
+    return p;
+}
+
+int posix_memalign(void **memptr, size_t alignment, size_t size)
+{
+    if (insideHook)
+    {
+        const char msg[] = "RECURSIVE posix_memalign\n";
+        write(STDERR_FILENO, msg, sizeof(msg) - 1);
+        return real_posix_memalign(memptr, alignment, size);
+    }
+    if (!real_posix_memalign)
+    {
+        real_posix_memalign = dlsym(RTLD_NEXT, "posix_memalign");
+    }
+    insideHook = 1;
+    open_file();
+    int ret = real_posix_memalign(memptr, alignment, size);
+    if (ret == 0 && memptr && *memptr)
+    {
+        log_alloc(size, *memptr);
+    }
+    insideHook = 0;
+    return ret;
+}
+
+void *aligned_alloc(size_t alignment, size_t size)
+{
+    if (insideHook)
+    {
+        const char msg[] = "RECURSIVE aligned_alloc\n";
+        write(STDERR_FILENO, msg, sizeof(msg) - 1);
+        return real_aligned_alloc(alignment, size);
+    }
+    if (!real_aligned_alloc)
+    {
+        real_aligned_alloc = dlsym(RTLD_NEXT, "aligned_alloc");
+    }
+    insideHook = 1;
+    open_file();
+    void *p = real_aligned_alloc(alignment, size);
+    log_alloc(size, p);
     insideHook = 0;
     return p;
 }
