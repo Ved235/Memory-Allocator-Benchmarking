@@ -52,7 +52,7 @@ GLIBC results:
   Sizes: Total=8MB, Avg=125B, Med=4B
 ```
 
-RPALLOC results:
+RPMALLOC results:
 ```
 [Alloc] Count: 16757635 | Avg: 46ns
   Worst: 8.91ms (20MB, TID:21864, t:18744942601ns)
