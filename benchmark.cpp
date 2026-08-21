@@ -13,6 +13,89 @@
 #include <memory>
 #include <x86intrin.h>
 #include <syncstream>
+#include <mimalloc.h>
+#include <gperftools/tcmalloc.h>
+#include <rpmalloc.h>
+
+#ifndef USE_MIMALLOC
+#define USE_MIMALLOC 0
+#endif
+
+#ifndef USE_GLIBC
+#define USE_GLIBC 0
+#endif
+
+#ifndef USE_TCMALLOC
+#define USE_TCMALLOC 0
+#endif
+
+#ifndef USE_RPMALLOC
+#define USE_RPMALLOC 0
+#endif
+
+#if USE_MIMALLOC
+struct Allocator {
+	static void Free(void* ptr) {
+		mi_free(ptr);
+	}
+	static void* Alloc(size_t size) {
+		return mi_malloc(size);
+	}
+	static void* Calloc(size_t numElements, size_t size) {
+		return mi_calloc(numElements, size);
+	}
+	static void* Realloc(void* ptr, size_t size) {
+		return mi_realloc(ptr, size);
+	}
+};
+#elif USE_GLIBC
+struct Allocator {
+	static void Free(void* ptr) {
+		std::free(ptr);
+	}
+	static void* Alloc(size_t size) {
+		return std::malloc(size);
+	}
+	static void* Calloc(size_t numElements, size_t size) {
+		return std::calloc(numElements, size);
+	}
+	static void* Realloc(void* ptr, size_t size) {
+		return std::realloc(ptr, size);
+	}
+};
+#elif USE_TCMALLOC
+struct Allocator {
+	static void Free(void* ptr) {
+		tc_free(ptr);
+	}
+	static void* Alloc(size_t size) {
+		return tc_malloc(size);
+	}
+	static void* Calloc(size_t numElements, size_t size) {
+		return tc_calloc(numElements, size);
+	}
+	static void* Realloc(void* ptr, size_t size) {
+		return tc_realloc(ptr, size);
+	}
+};
+#elif USE_RPMALLOC
+struct Allocator {
+	static void Free(void* ptr) {
+		rpfree(ptr);
+	}
+	static void* Alloc(size_t size) {
+		return rpmalloc(size);
+	}
+	static void* Calloc(size_t numElements, size_t size) {
+		return rpcalloc(numElements, size);
+	}
+	static void* Realloc(void* ptr, size_t size) {
+		return rprealloc(ptr, size);
+	}
+};
+#else
+#error "No allocator chosen"
+#endif
 
 using Nanoseconds = std::chrono::nanoseconds;
 
@@ -41,21 +124,6 @@ struct MemoryEntry {
 	uint64_t opTime {0};
 	Nanoseconds originalTimestamp{ 0 };
 	Nanoseconds replayTimestamp;
-};
-
-struct Allocator {
-	static void Free(void* ptr) {
-		free(ptr);
-	}
-	static void* Alloc(size_t size) {
-		return malloc(size);
-	}
-	static void* Calloc(size_t numElements, size_t size) {
-		return calloc(numElements, size);
-	}
-	static void* Realloc(void* ptr, size_t size) {
-		return realloc(ptr, size);
-	}
 };
 
 std::string formatNs(double ns) {
@@ -343,6 +411,9 @@ void ReplayJournal(std::vector<MemoryEntry>& entries) {
 		                         &waitForTime,
 		                         &entries,
 		tid]() {
+#if USE_RPMALLOC
+			rpmalloc_thread_initialize();
+#endif
 			while (!startFlag.load(std::memory_order_acquire)) {
 				continue;
 			}
@@ -457,6 +528,9 @@ void ReplayJournal(std::vector<MemoryEntry>& entries) {
 		if (rc != 0) {
 			std::cerr << "Error pinning thread " << tid << " to core " << targetCore << "\n";
 		}
+#if USE_RPMALLOC
+		rpmalloc_thread_finalize();
+#endif
 	}
 
 	startTime = Clock::now();
@@ -552,6 +626,10 @@ int main() {
 	std::cout << "Pre processing journal\n";
 	ProcessJournal(entries);
 	std::cout << "Starting replay\n";
+#if USE_RPMALLOC
+	std::cout << "Initializing rpmalloc\n";
+	rpmalloc_initialize(nullptr);
+#endif
 	ReplayJournal(entries);
 	PrintJournal(entries);
 	return 0;
