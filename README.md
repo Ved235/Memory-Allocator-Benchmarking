@@ -3,14 +3,18 @@ The repository contains two parts to micro-benchmark memory allocators under a r
 1. A recorder
 2. The replay benchmark
 
+### Recorder
+
 The custom recorder intercepts and records all allocations and deallocations of the game (**malloc**, **free**, **calloc**, **realloc**, even **aligned allocations**). It performs function hooking and using `dlsym(RTLD_NEXT,...)` it resolves the libc functions so that the real allocator can be called. By carefully analyzing SuperTuxKart source code and its linkage the correct underlying function hooks were made. The `recorder.c` is then compiled to a shared library using:
 
-`gcc -shared -fPIC -o recorder.so recorder.c -ldl`
+```bash
+gcc -shared -fPIC -o recorder.so recorder.c -ldl
+```
 
-Then using the command `LD_PRELOAD=recorder.so /bin/supertuxkart` the game is ran. Using `LD_PRELOAD` ensures that the recorder shared library is loaded before all other dynamically linked libraries which ensures all allocation calls can be intercepted. The logging functions use a stack allocated buffer and the _write_ syscall to prevent internal allocations and save data directly to `alloc_log.txt`. Despite the logging overhead the game ran on 60 FPS and a **33,771,118** entries long log file was generated.
+Then using the command `LD_PRELOAD=recorder.so /bin/supertuxkart` the game is ran. Using `LD_PRELOAD` ensures that the recorder shared library is loaded before all other dynamically linked libraries which ensures all allocation calls can be intercepted. The logging functions use a stack allocated buffer and the _write_ syscall to prevent internal allocations and save data directly to `alloc_log.txt`. Despite the logging overhead the game ran on stable 60 FPS and a **33,771,118** entries long log file was generated.
 
+### Benchmarking
 The benchmark script comprises of several stages. Firstly, the replay journal is parsed and the entries from the text file are converted into a `MemoryEntry` vector. It uses `mmap()` to map the file and bypass slower I/O operations. Secondly, the vector is now processed to reorder any out of order allocations and frees due to discrepancies in thread timings.  
-
 Current log parsing gives the following output:
 
 ```
@@ -38,90 +42,108 @@ Remaining live allocations: 3988
 Leaked memory: 295KB
 ```
 
-GLIBC results:
+To reduce overhead as much as possible `RDTSC` clock is used to time each memory operation. It's implemented in the following manner:
 
+```cpp
+unsigned int aux;
+
+_mm_lfence();
+uint64_t opStart = __rdtsc();
+
+operation();
+
+uint64_t opEnd = __rdtscp(&aux);
+_mm_lfence();
 ```
-[Alloc] Count: 16757635 | Avg: 46ns
-  Worst: 8.82ms (20MB, TID:21864, t:18674713176ns)
-  Times: Best=10ns, p1=20ns, p10=20ns, p25=20ns, p50=30ns, p75=30ns, p90=60ns, p95=70ns, p99=160ns, p99.9=511ns, p99.99=3.93us, p99.999=173.93us, Worst=8.82ms
+`_mm_lfence` and `__rdtscp` are compiler intrinsics that ensure serialization to stop out-of-order execution which can corrupt the timings. To increase consistency and accuracy of results the kernel was booted with: `nosmt isolcpus=domain,managed_irq,6-11 irqaffinity=0-5` (The desktop environment had 12 cores and 24 logical processors due to SMT). By isolating both cores 6 to 11, random noise and uncertainty in the benchmark due to OS scheduler and interrupts was reduced. Inside the replay each thread was pinned to an isolated core using `pthread_setaffinity_np()`. Out of the 49 threads recorded, 5 were pinned to individual cores due to heavy workload and the remaining 44 were pinned to a single core due to light workload. The benchmark ran using:
+```bash
+sudo taskset -c 5 perf stat -e cpu-migrations ./benchmark
+```
+`taskset -c 5` ensures that the main thread keeps running on core 5 and does not pollute cpu-migrations count. The final count of *cpu-migrations* was *49* which confirms that thread pinning worked correctly (Each thread started on core 5 then was migrated once to its respective pinned core).
+
+### Final Results
+*Certain tail latencies might be inflated as a result of page-faults. To isolate further I tried using `nohz_full` but this resulted in worse times. This might be due to the added overhead of switching from userspace to kernel-space during page-fault handling and while requesting extra memory using syscalls. Additionally, `nohz_full` potentially adds overhead when multiple threads are running on the isolated core (which happens on the LIGHTCORE 11).*
+
+#### GLIBC results:
+```
+[Alloc] Count: 16757635 | Avg: 38ns
+  Worst: 7.03ms (20MB, TID:21864, t:18674713176ns)
+  Times: Best=10ns, p1=10ns, p10=20ns, p25=20ns, p50=20ns, p75=30ns, p90=40ns, p95=50ns, p99=140ns, p99.9=461ns, p99.99=3.10us, p99.999=142.54us, Worst=7.03ms
   Sizes: Total=2.65GB, Avg=169B, Med=28B
 
-[Free] Count: 16872131 | Avg: 39ns
-  Times: Best=10ns, p1=20ns, p10=20ns, p25=20ns, p50=30ns, p75=40ns, p90=60ns, p95=90ns, p99=210ns, p99.9=501ns, p99.99=952ns, p99.999=3.36us, Worst=2.60ms
+[Free] Count: 16872131 | Avg: 33ns
+  Times: Best=10ns, p1=10ns, p10=20ns, p25=20ns, p50=20ns, p75=40ns, p90=50ns, p95=70ns, p99=180ns, p99.9=481ns, p99.99=872ns, p99.999=2.71us, Worst=1.90ms
 
-[Calloc] Count: 71649 | Avg: 69ns
-  Worst: 76.92us (142KB, TID:21892, t:1368892668ns)
-  Times: Best=20ns, p1=20ns, p10=30ns, p25=30ns, p50=40ns, p75=50ns, p90=90ns, p95=150ns, p99=311ns, p99.9=3.86us, p99.99=24.01us, p99.999=76.92us, Worst=76.92us
+[Calloc] Count: 71649 | Avg: 58ns
+  Worst: 72.93us (142KB, TID:21892, t:1368892668ns)
+  Times: Best=10ns, p1=20ns, p10=20ns, p25=20ns, p50=30ns, p75=40ns, p90=80ns, p95=140ns, p99=301ns, p99.9=3.41us, p99.99=16.61us, p99.999=72.93us, Worst=72.93us
   Sizes: Total=20MB, Avg=298B, Med=88B
 
-[Realloc] Count: 69703 | Avg: 56ns
-  Worst: 113.27us (307KB, TID:21864, t:1095154833ns)
-  Times: Best=20ns, p1=20ns, p10=20ns, p25=30ns, p50=30ns, p75=30ns, p90=60ns, p95=80ns, p99=220ns, p99.9=4.72us, p99.99=13.77us, p99.999=113.27us, Worst=113.27us
+[Realloc] Count: 69703 | Avg: 47ns
+  Worst: 86.41us (307KB, TID:21864, t:1095154833ns)
+  Times: Best=10ns, p1=10ns, p10=20ns, p25=20ns, p50=20ns, p75=30ns, p90=60ns, p95=70ns, p99=200ns, p99.9=3.77us, p99.99=10.14us, p99.999=86.41us, Worst=86.41us
   Sizes: Total=8MB, Avg=125B, Med=4B
 ```
 
-RPMALLOC results:
-
+#### RPMALLOC results:
 ```
-[Alloc] Count: 16757635 | Avg: 46ns
-  Worst: 8.91ms (20MB, TID:21864, t:18744942601ns)
-  Times: Best=20ns, p1=20ns, p10=20ns, p25=30ns, p50=30ns, p75=30ns, p90=40ns, p95=60ns, p99=130ns, p99.9=1.07us, p99.99=4.95us, p99.999=239.31us, Worst=8.91ms
+[Alloc] Count: 16757635 | Avg: 40ns
+  Worst: 6.88ms (20MB, TID:21864, t:18674713176ns)
+  Times: Best=20ns, p1=20ns, p10=20ns, p25=20ns, p50=30ns, p75=30ns, p90=40ns, p95=60ns, p99=130ns, p99.9=1.23us, p99.99=4.03us, p99.999=173.98us, Worst=6.88ms
   Sizes: Total=2.65GB, Avg=169B, Med=28B
 
-[Free] Count: 16872131 | Avg: 42ns
-  Times: Best=20ns, p1=30ns, p10=30ns, p25=30ns, p50=40ns, p75=40ns, p90=50ns, p95=70ns, p99=140ns, p99.9=321ns, p99.99=531ns, p99.999=1.04us, Worst=5.39ms
+[Free] Count: 16872131 | Avg: 35ns
+  Times: Best=20ns, p1=20ns, p10=20ns, p25=30ns, p50=30ns, p75=30ns, p90=40ns, p95=50ns, p99=130ns, p99.9=311ns, p99.99=611ns, p99.999=2.80us, Worst=4.40ms
 
-[Calloc] Count: 71649 | Avg: 111ns
-  Worst: 287.85us (88B, TID:21864, t:3973586100ns)
-  Times: Best=20ns, p1=20ns, p10=30ns, p25=30ns, p50=40ns, p75=80ns, p90=140ns, p95=160ns, p99=1.27us, p99.9=4.25us, p99.99=71.18us, p99.999=287.85us, Worst=287.85us
+[Calloc] Count: 71649 | Avg: 90ns
+  Worst: 104.07us (265KB, TID:21864, t:1283391718ns)
+  Times: Best=20ns, p1=20ns, p10=20ns, p25=30ns, p50=40ns, p75=70ns, p90=130ns, p95=150ns, p99=1.23us, p99.9=3.53us, p99.99=35.62us, p99.999=104.07us, Worst=104.07us
   Sizes: Total=20MB, Avg=298B, Med=88B
 
-[Realloc] Count: 69703 | Avg: 62ns
-  Worst: 127.62us (307KB, TID:21864, t:1041923157ns)
-  Times: Best=20ns, p1=30ns, p10=30ns, p25=30ns, p50=30ns, p75=40ns, p90=60ns, p95=80ns, p99=230ns, p99.9=2.80us, p99.99=41.45us, p99.999=127.62us, Worst=127.62us
+[Realloc] Count: 69703 | Avg: 53ns
+  Worst: 84.97us (307KB, TID:21864, t:1041923157ns)
+  Times: Best=20ns, p1=20ns, p10=20ns, p25=30ns, p50=30ns, p75=30ns, p90=60ns, p95=70ns, p99=230ns, p99.9=2.30us, p99.99=28.12us, p99.999=84.97us, Worst=84.97us
   Sizes: Total=8MB, Avg=125B, Med=4B
 ```
 
-MIMALLOC results:
-
+#### MIMALLOC results:
 ```
-[Alloc] Count: 16757635 | Avg: 39ns
-  Worst: 8.60ms (20MB, TID:21864, t:18744942601ns)
-  Times: Best=10ns, p1=20ns, p10=20ns, p25=20ns, p50=20ns, p75=30ns, p90=30ns, p95=40ns, p99=120ns, p99.9=471ns, p99.99=3.82us, p99.999=229.69us, Worst=8.60ms
+[Alloc] Count: 16757635 | Avg: 34ns
+  Worst: 6.72ms (20MB, TID:21864, t:18744942601ns)
+  Times: Best=10ns, p1=10ns, p10=20ns, p25=20ns, p50=20ns, p75=30ns, p90=30ns, p95=40ns, p99=120ns, p99.9=501ns, p99.99=3.26us, p99.999=217.35us, Worst=6.72ms
   Sizes: Total=2.65GB, Avg=169B, Med=28B
 
-[Free] Count: 16872131 | Avg: 26ns
-  Times: Best=10ns, p1=20ns, p10=20ns, p25=20ns, p50=20ns, p75=30ns, p90=30ns, p95=40ns, p99=130ns, p99.9=301ns, p99.99=531ns, p99.999=1.09us, Worst=121.57us
+[Free] Count: 16872131 | Avg: 24ns
+  Times: Best=10ns, p1=10ns, p10=20ns, p25=20ns, p50=20ns, p75=20ns, p90=30ns, p95=30ns, p99=120ns, p99.9=311ns, p99.99=591ns, p99.999=2.11us, Worst=160.50us
 
-[Calloc] Count: 71649 | Avg: 79ns
-  Worst: 142.57us (265KB, TID:21864, t:1283391718ns)
-  Times: Best=10ns, p1=20ns, p10=20ns, p25=20ns, p50=30ns, p75=50ns, p90=130ns, p95=150ns, p99=451ns, p99.9=4.45us, p99.99=36.07us, p99.999=142.57us, Worst=142.57us
+[Calloc] Count: 71649 | Avg: 74ns
+  Worst: 115.64us (265KB, TID:21864, t:1283391718ns)
+  Times: Best=10ns, p1=10ns, p10=20ns, p25=20ns, p50=30ns, p75=50ns, p90=130ns, p95=150ns, p99=451ns, p99.9=4.08us, p99.99=28.39us, p99.999=115.64us, Worst=115.64us
   Sizes: Total=20MB, Avg=298B, Med=88B
 
-[Realloc] Count: 69703 | Avg: 46ns
-  Worst: 121.72us (307KB, TID:21864, t:1041923157ns)
-  Times: Best=10ns, p1=20ns, p10=20ns, p25=20ns, p50=20ns, p75=30ns, p90=40ns, p95=50ns, p99=180ns, p99.9=2.46us, p99.99=26.27us, p99.999=121.72us, Worst=121.72us
+[Realloc] Count: 69703 | Avg: 41ns
+  Worst: 101.26us (307KB, TID:21864, t:1041923157ns)
+  Times: Best=10ns, p1=10ns, p10=20ns, p25=20ns, p50=20ns, p75=30ns, p90=40ns, p95=50ns, p99=170ns, p99.9=1.96us, p99.99=16.88us, p99.999=101.26us, Worst=101.26us
   Sizes: Total=8MB, Avg=125B, Med=4B
 ```
 
-TCMALLOC results:
-
+#### TCMALLOC results:
 ```
-[Alloc] Count: 16757635 | Avg: 33ns
-  Worst: 8.69ms (20MB, TID:21864, t:18744942601ns)
-  Times: Best=10ns, p1=20ns, p10=20ns, p25=20ns, p50=20ns, p75=30ns, p90=30ns, p95=30ns, p99=50ns, p99.9=260ns, p99.99=3.63us, p99.999=40.99us, Worst=8.69ms
+[Alloc] Count: 16757635 | Avg: 28ns
+  Worst: 6.82ms (20MB, TID:21864, t:18744942601ns)
+  Times: Best=10ns, p1=10ns, p10=20ns, p25=20ns, p50=20ns, p75=20ns, p90=20ns, p95=30ns, p99=40ns, p99.9=250ns, p99.99=2.87us, p99.999=33.58us, Worst=6.82ms
   Sizes: Total=2.65GB, Avg=169B, Med=28B
 
-[Free] Count: 16872131 | Avg: 27ns
-  Times: Best=10ns, p1=20ns, p10=20ns, p25=20ns, p50=20ns, p75=30ns, p90=30ns, p95=30ns, p99=130ns, p99.9=311ns, p99.99=661ns, p99.999=3.24us, Worst=354.14us
+[Free] Count: 16872131 | Avg: 24ns
+  Times: Best=10ns, p1=10ns, p10=20ns, p25=20ns, p50=20ns, p75=20ns, p90=30ns, p95=30ns, p99=120ns, p99.9=301ns, p99.99=771ns, p99.999=3.37us, Worst=350.40us
 
-[Calloc] Count: 71649 | Avg: 55ns
-  Worst: 143.59us (142KB, TID:21892, t:1368892668ns)
-  Times: Best=10ns, p1=20ns, p10=20ns, p25=30ns, p50=30ns, p75=40ns, p90=60ns, p95=130ns, p99=331ns, p99.9=2.07us, p99.99=23.76us, p99.999=143.59us, Worst=143.59us
+[Calloc] Count: 71649 | Avg: 48ns
+  Worst: 97.79us (112B, TID:21864, t:3529145387ns)
+  Times: Best=10ns, p1=20ns, p10=20ns, p25=20ns, p50=30ns, p75=40ns, p90=50ns, p95=130ns, p99=321ns, p99.9=2.03us, p99.99=21.69us, p99.999=97.79us, Worst=97.79us
   Sizes: Total=20MB, Avg=298B, Med=88B
 
-[Realloc] Count: 69703 | Avg: 37ns
-  Worst: 32.54us (307KB, TID:21864, t:1041923157ns)
-  Times: Best=20ns, p1=20ns, p10=20ns, p25=20ns, p50=20ns, p75=30ns, p90=40ns, p95=50ns, p99=160ns, p99.9=1.35us, p99.99=12.87us, p99.999=32.54us, Worst=32.54us
+[Realloc] Count: 69703 | Avg: 34ns
+  Worst: 30.12us (307KB, TID:21864, t:1041923157ns)
+  Times: Best=10ns, p1=10ns, p10=20ns, p25=20ns, p50=20ns, p75=30ns, p90=40ns, p95=50ns, p99=170ns, p99.9=1.38us, p99.99=9.23us, p99.999=30.12us, Worst=30.12us
   Sizes: Total=8MB, Avg=125B, Med=4B
 ```
